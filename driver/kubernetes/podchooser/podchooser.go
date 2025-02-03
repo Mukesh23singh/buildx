@@ -6,6 +6,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/pkg/errors"
 	"github.com/serialx/hashring"
 	"github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
@@ -29,11 +30,14 @@ func (pc *RandomPodChooser) ChoosePod(ctx context.Context) (*corev1.Pod, error) 
 	if err != nil {
 		return nil, err
 	}
+	if len(pods) == 0 {
+		return nil, errors.New("no running buildkit pods found")
+	}
 	randSource := pc.RandSource
 	if randSource == nil {
 		randSource = rand.NewSource(time.Now().Unix())
 	}
-	rnd := rand.New(randSource)
+	rnd := rand.New(randSource) //nolint:gosec // no strong seeding required
 	n := rnd.Int() % len(pods)
 	logrus.Debugf("RandomPodChooser.ChoosePod(): len(pods)=%d, n=%d", len(pods), n)
 	return pods[n], nil

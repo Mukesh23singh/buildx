@@ -3,7 +3,7 @@ package main
 import (
 	"log"
 	"os"
-	"path/filepath"
+	"strings"
 
 	"github.com/docker/buildx/commands"
 	clidocstool "github.com/docker/cli-docs-tool"
@@ -17,6 +17,7 @@ import (
 	_ "github.com/docker/buildx/driver/docker"
 	_ "github.com/docker/buildx/driver/docker-container"
 	_ "github.com/docker/buildx/driver/kubernetes"
+	_ "github.com/docker/buildx/driver/remote"
 )
 
 const defaultSourcePath = "docs/reference/"
@@ -24,6 +25,28 @@ const defaultSourcePath = "docs/reference/"
 type options struct {
 	source  string
 	formats []string
+}
+
+// fixUpExperimentalCLI trims the " (EXPERIMENTAL)" suffix from the CLI output,
+// as docs.docker.com already displays "experimental (CLI)",
+//
+// https://github.com/docker/buildx/pull/2188#issuecomment-1889487022
+func fixUpExperimentalCLI(cmd *cobra.Command) {
+	const (
+		annotationExperimentalCLI = "experimentalCLI"
+		suffixExperimental        = " (EXPERIMENTAL)"
+	)
+	if _, ok := cmd.Annotations[annotationExperimentalCLI]; ok {
+		cmd.Short = strings.TrimSuffix(cmd.Short, suffixExperimental)
+	}
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if _, ok := f.Annotations[annotationExperimentalCLI]; ok {
+			f.Usage = strings.TrimSuffix(f.Usage, suffixExperimental)
+		}
+	})
+	for _, c := range cmd.Commands() {
+		fixUpExperimentalCLI(c)
+	}
 }
 
 func gen(opts *options) error {
@@ -40,27 +63,30 @@ func gen(opts *options) error {
 	}
 
 	cmd.AddCommand(commands.NewRootCmd("buildx", true, dockerCLI))
-	clidocstool.DisableFlagsInUseLine(cmd)
 
-	cwd, _ := os.Getwd()
-	source := filepath.Join(cwd, opts.source)
-
-	if err = os.MkdirAll(source, 0755); err != nil {
+	c, err := clidocstool.New(clidocstool.Options{
+		Root:      cmd,
+		SourceDir: opts.source,
+		Plugin:    true,
+	})
+	if err != nil {
 		return err
 	}
 
 	for _, format := range opts.formats {
 		switch format {
 		case "md":
-			if err = clidocstool.GenMarkdownTree(cmd, source); err != nil {
+			if err = c.GenMarkdownTree(cmd); err != nil {
 				return err
 			}
 		case "yaml":
-			if err = clidocstool.GenYamlTree(cmd, source); err != nil {
+			// fix up is needed only for yaml (used for generating docs.docker.com contents)
+			fixUpExperimentalCLI(cmd)
+			if err = c.GenYamlTree(cmd); err != nil {
 				return err
 			}
 		default:
-			return errors.Errorf("unknwown doc format %q", format)
+			return errors.Errorf("unknown format %q", format)
 		}
 	}
 

@@ -8,11 +8,16 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	"github.com/containerd/log"
+	"github.com/distribution/reference"
+	"github.com/docker/buildx/util/resolver"
 	clitypes "github.com/docker/cli/cli/config/types"
-	"github.com/docker/distribution/reference"
+	"github.com/moby/buildkit/util/contentutil"
+	"github.com/moby/buildkit/util/tracing"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	"github.com/sirupsen/logrus"
 )
 
 type Auth interface {
@@ -20,30 +25,53 @@ type Auth interface {
 }
 
 type Opt struct {
-	Auth Auth
+	Auth           Auth
+	RegistryConfig map[string]resolver.RegistryConfig
 }
 
 type Resolver struct {
-	r remotes.Resolver
+	auth   docker.Authorizer
+	hosts  docker.RegistryHosts
+	buffer contentutil.Buffer
 }
 
 func New(opt Opt) *Resolver {
-	resolver := docker.NewResolver(docker.ResolverOptions{
-		Client:      http.DefaultClient,
-		Credentials: toCredentialsFunc(opt.Auth),
-	})
 	return &Resolver{
-		r: resolver,
+		auth:   docker.NewDockerAuthorizer(docker.WithAuthCreds(toCredentialsFunc(opt.Auth)), docker.WithAuthClient(http.DefaultClient)),
+		hosts:  resolver.NewRegistryConfig(opt.RegistryConfig),
+		buffer: contentutil.NewBuffer(),
 	}
 }
 
+func (r *Resolver) resolver() remotes.Resolver {
+	return docker.NewResolver(docker.ResolverOptions{
+		Hosts: func(domain string) ([]docker.RegistryHost, error) {
+			res, err := r.hosts(domain)
+			if err != nil {
+				return nil, err
+			}
+			for i := range res {
+				res[i].Authorizer = r.auth
+				res[i].Client = tracing.DefaultClient
+			}
+			return res, nil
+		},
+	})
+}
+
 func (r *Resolver) Resolve(ctx context.Context, in string) (string, ocispec.Descriptor, error) {
+	// discard containerd logger to avoid printing unnecessary info during image reference resolution.
+	// https://github.com/containerd/containerd/blob/1a88cf5242445657258e0c744def5017d7cfb492/remotes/docker/resolver.go#L288
+	logger := logrus.New()
+	logger.Out = io.Discard
+	ctx = log.WithLogger(ctx, logrus.NewEntry(logger))
+
 	ref, err := parseRef(in)
 	if err != nil {
 		return "", ocispec.Descriptor{}, err
 	}
 
-	in, desc, err := r.r.Resolve(ctx, ref.String())
+	in, desc, err := r.resolver().Resolve(ctx, ref.String())
 	if err != nil {
 		return "", ocispec.Descriptor{}, err
 	}
@@ -65,7 +93,7 @@ func (r *Resolver) Get(ctx context.Context, in string) ([]byte, ocispec.Descript
 }
 
 func (r *Resolver) GetDescriptor(ctx context.Context, in string, desc ocispec.Descriptor) ([]byte, error) {
-	fetcher, err := r.r.Fetcher(ctx, in)
+	fetcher, err := r.resolver().Fetcher(ctx, in)
 	if err != nil {
 		return nil, err
 	}

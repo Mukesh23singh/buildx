@@ -1,5 +1,5 @@
 [![PkgGoDev](https://img.shields.io/badge/go.dev-docs-007d9c?logo=go&logoColor=white&style=flat-square)](https://pkg.go.dev/github.com/docker/cli-docs-tool)
-[![Test Status](https://img.shields.io/github/workflow/status/docker/cli-docs-tool/test?label=test&logo=github&style=flat-square)](https://github.com/docker/cli-docs-tool/actions?query=workflow%3Atest)
+[![Test Status](https://img.shields.io/github/actions/workflow/status/docker/cli-docs-tool/test.yml?branch=main&label=test&logo=github&style=flat-square)](https://github.com/docker/cli-docs-tool/actions?query=workflow%3Atest)
 [![Go Report Card](https://goreportcard.com/badge/github.com/docker/cli-docs-tool)](https://goreportcard.com/report/github.com/docker/cli-docs-tool)
 
 ## About
@@ -41,61 +41,10 @@ require (
 )
 ```
 
-Next, create a file named `docgen.go` inside that directory containing the
-following Go code:
+Next, create a file named `main.go` inside that directory containing the
+following Go code from [`example/main.go`](example/main.go).
 
-```go
-package main
-
-import (
-  "log"
-  "os"
-  "path/filepath"
-
-  "github.com/docker/buildx/commands"
-  "github.com/docker/cli/cli/command"
-  clidocstool "github.com/docker/cli-docs-tool"
-  "github.com/spf13/cobra"
-)
-
-const sourcePath = "docs/"
-
-func main() {
-  log.SetFlags(0)
-
-  dockerCLI, err := command.NewDockerCli()
-  if err != nil {
-    log.Printf("ERROR: %+v", err)
-  }
-
-  cmd := &cobra.Command{
-    Use:               "docker [OPTIONS] COMMAND [ARG...]",
-    Short:             "The base command for the Docker CLI.",
-    DisableAutoGenTag: true,
-  }
-
-  cmd.AddCommand(commands.NewRootCmd("buildx", true, dockerCLI))
-  clidocstool.DisableFlagsInUseLine(cmd)
-
-  cwd, _ := os.Getwd()
-  source := filepath.Join(cwd, sourcePath)
-
-  // Make sure "source" folder is created first
-  if err = os.MkdirAll(source, 0755); err != nil {
-    log.Printf("ERROR: %+v", err)
-  }
-  
-  // Generate Markdown and YAML documentation to "source" folder
-  if err = clidocstool.GenTree(cmd, source); err != nil {
-    log.Printf("ERROR: %+v", err)
-  }
-}
-```
-
-Here we create a new instance of Docker CLI with `command.NewDockerCli` and a
-subcommand `commands.NewRootCmd` for `buildx`.
-
-Finally, we generate Markdown and YAML documentation with `clidocstool.GenTree`.
+Running this example should produce the following output:
 
 ```console
 $ go run main.go

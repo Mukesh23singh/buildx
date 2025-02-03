@@ -1,18 +1,7 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package otelhttptrace
+package otelhttptrace // import "go.opentelemetry.io/contrib/instrumentation/net/http/httptrace/otelhttptrace"
 
 import (
 	"context"
@@ -22,13 +11,15 @@ import (
 	"strings"
 	"sync"
 
-	"go.opentelemetry.io/contrib"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	semconv "go.opentelemetry.io/otel/semconv/v1.4.0"
+	semconv "go.opentelemetry.io/otel/semconv/v1.20.0"
 	"go.opentelemetry.io/otel/trace"
 )
+
+// ScopeName is the instrumentation scope name.
+const ScopeName = "go.opentelemetry.io/otel/instrumentation/httptrace"
 
 // HTTP attributes.
 var (
@@ -45,13 +36,11 @@ var (
 	HTTPDNSAddrs               = attribute.Key("http.dns.addrs")
 )
 
-var (
-	hookMap = map[string]string{
-		"http.dns":     "http.getconn",
-		"http.connect": "http.getconn",
-		"http.tls":     "http.getconn",
-	}
-)
+var hookMap = map[string]string{
+	"http.dns":     "http.getconn",
+	"http.connect": "http.getconn",
+	"http.tls":     "http.getconn",
+}
 
 func parentHook(hook string) string {
 	if strings.HasPrefix(hook, "http.connect") {
@@ -62,39 +51,71 @@ func parentHook(hook string) string {
 
 // ClientTraceOption allows customizations to how the httptrace.Client
 // collects information.
-type ClientTraceOption func(*clientTracer)
+type ClientTraceOption interface {
+	apply(*clientTracer)
+}
 
-// WithoutSubSpans will modify the httptrace.Client to only collect data
+type clientTraceOptionFunc func(*clientTracer)
+
+func (fn clientTraceOptionFunc) apply(c *clientTracer) {
+	fn(c)
+}
+
+// WithoutSubSpans will modify the httptrace.ClientTrace to only collect data
 // as Events and Attributes on a span found in the context.  By default
 // sub-spans will be generated.
 func WithoutSubSpans() ClientTraceOption {
-	return func(ct *clientTracer) {
+	return clientTraceOptionFunc(func(ct *clientTracer) {
 		ct.useSpans = false
-	}
+	})
 }
 
 // WithRedactedHeaders will be replaced by fixed '****' values for the header
 // names provided.  These are in addition to the sensitive headers already
 // redacted by default: Authorization, WWW-Authenticate, Proxy-Authenticate
-// Proxy-Authorization, Cookie, Set-Cookie
+// Proxy-Authorization, Cookie, Set-Cookie.
 func WithRedactedHeaders(headers ...string) ClientTraceOption {
-	return func(ct *clientTracer) {
+	return clientTraceOptionFunc(func(ct *clientTracer) {
 		for _, header := range headers {
 			ct.redactedHeaders[strings.ToLower(header)] = struct{}{}
 		}
-	}
+	})
 }
 
-// WithoutHeaders will disable adding span annotations for the http headers
+// WithoutHeaders will disable adding span attributes for the http headers
 // and values.
 func WithoutHeaders() ClientTraceOption {
-	return func(ct *clientTracer) {
+	return clientTraceOptionFunc(func(ct *clientTracer) {
 		ct.addHeaders = false
-	}
+	})
+}
+
+// WithInsecureHeaders will add span attributes for all http headers *INCLUDING*
+// the sensitive headers that are redacted by default.  The attribute values
+// will include the raw un-redacted text.  This might be useful for
+// debugging authentication related issues, but should not be used for
+// production deployments.
+func WithInsecureHeaders() ClientTraceOption {
+	return clientTraceOptionFunc(func(ct *clientTracer) {
+		ct.addHeaders = true
+		ct.redactedHeaders = nil
+	})
+}
+
+// WithTracerProvider specifies a tracer provider for creating a tracer.
+// The global provider is used if none is specified.
+func WithTracerProvider(provider trace.TracerProvider) ClientTraceOption {
+	return clientTraceOptionFunc(func(ct *clientTracer) {
+		if provider != nil {
+			ct.tracerProvider = provider
+		}
+	})
 }
 
 type clientTracer struct {
 	context.Context
+
+	tracerProvider trace.TracerProvider
 
 	tr trace.Tracer
 
@@ -106,6 +127,13 @@ type clientTracer struct {
 	useSpans        bool
 }
 
+// NewClientTrace returns an httptrace.ClientTrace implementation that will
+// record OpenTelemetry spans for requests made by an http.Client. By default
+// several spans will be added to the trace for various stages of a request
+// (dns, connection, tls, etc). Also by default, all HTTP headers will be
+// added as attributes to spans, although several headers will be automatically
+// redacted: Authorization, WWW-Authenticate, Proxy-Authenticate,
+// Proxy-Authorization, Cookie, and Set-Cookie.
 func NewClientTrace(ctx context.Context, opts ...ClientTraceOption) *httptrace.ClientTrace {
 	ct := &clientTracer{
 		Context:     ctx,
@@ -121,20 +149,20 @@ func NewClientTrace(ctx context.Context, opts ...ClientTraceOption) *httptrace.C
 		addHeaders: true,
 		useSpans:   true,
 	}
-	for _, opt := range opts {
-		opt(ct)
-	}
 
-	var tp trace.TracerProvider
 	if span := trace.SpanFromContext(ctx); span.SpanContext().IsValid() {
-		tp = span.TracerProvider()
+		ct.tracerProvider = span.TracerProvider()
 	} else {
-		tp = otel.GetTracerProvider()
+		ct.tracerProvider = otel.GetTracerProvider()
 	}
 
-	ct.tr = tp.Tracer(
-		"go.opentelemetry.io/otel/instrumentation/httptrace",
-		trace.WithInstrumentationVersion(contrib.SemVersion()),
+	for _, opt := range opts {
+		opt.apply(ct)
+	}
+
+	ct.tr = ct.tracerProvider.Tracer(
+		ScopeName,
+		trace.WithInstrumentationVersion(Version()),
 	)
 
 	return &httptrace.ClientTrace{
@@ -187,6 +215,10 @@ func (ct *clientTracer) start(hook, spanName string, attrs ...attribute.KeyValue
 
 func (ct *clientTracer) end(hook string, err error, attrs ...attribute.KeyValue) {
 	if !ct.useSpans {
+		// sometimes end may be called without previous start
+		if ct.root == nil {
+			ct.root = trace.SpanFromContext(ct.Context)
+		}
 		if err != nil {
 			attrs = append(attrs, attribute.String(hook+".error", err.Error()))
 		}
@@ -234,7 +266,7 @@ func (ct *clientTracer) span(hook string) trace.Span {
 }
 
 func (ct *clientTracer) getConn(host string) {
-	ct.start("http.getconn", "http.getconn", semconv.HTTPHostKey.String(host))
+	ct.start("http.getconn", "http.getconn", semconv.NetHostName(host))
 }
 
 func (ct *clientTracer) gotConn(info httptrace.GotConnInfo) {
@@ -259,7 +291,7 @@ func (ct *clientTracer) gotFirstResponseByte() {
 }
 
 func (ct *clientTracer) dnsStart(info httptrace.DNSStartInfo) {
-	ct.start("http.dns", "http.dns", semconv.HTTPHostKey.String(info.Host))
+	ct.start("http.dns", "http.dns", semconv.NetHostName(info.Host))
 }
 
 func (ct *clientTracer) dnsDone(info httptrace.DNSDoneInfo) {
@@ -304,7 +336,7 @@ func (ct *clientTracer) wroteHeaderField(k string, v []string) {
 	if _, ok := ct.redactedHeaders[k]; ok {
 		value = "****"
 	}
-	ct.root.SetAttributes(attribute.String("http."+k, value))
+	ct.root.SetAttributes(attribute.String("http.request.header."+k, value))
 }
 
 func (ct *clientTracer) wroteHeaders() {
@@ -332,7 +364,7 @@ func (ct *clientTracer) got100Continue() {
 func (ct *clientTracer) wait100Continue() {
 	span := ct.root
 	if ct.useSpans {
-		span = ct.span("http.receive")
+		span = ct.span("http.send")
 	}
 	span.AddEvent("GOT 100 - Wait")
 }
@@ -360,11 +392,11 @@ func sm2s(value map[string][]string) string {
 	var buf strings.Builder
 	for k, v := range value {
 		if buf.Len() != 0 {
-			buf.WriteString(",")
+			_, _ = buf.WriteString(",")
 		}
-		buf.WriteString(k)
-		buf.WriteString("=")
-		buf.WriteString(sliceToString(v))
+		_, _ = buf.WriteString(k)
+		_, _ = buf.WriteString("=")
+		_, _ = buf.WriteString(sliceToString(v))
 	}
 	return buf.String()
 }

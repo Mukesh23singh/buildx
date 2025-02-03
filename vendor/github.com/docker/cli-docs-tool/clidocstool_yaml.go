@@ -17,16 +17,16 @@ package clidocstool
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/docker/cli-docs-tool/annotation"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 type cmdOption struct {
@@ -37,6 +37,7 @@ type cmdOption struct {
 	Description     string `yaml:",omitempty"`
 	DetailsURL      string `yaml:"details_url,omitempty"` // DetailsURL contains an anchor-id or link for more information on this flag
 	Deprecated      bool
+	Hidden          bool
 	MinAPIVersion   string `yaml:"min_api_version,omitempty"`
 	Experimental    bool
 	ExperimentalCLI bool
@@ -61,6 +62,7 @@ type cmdDoc struct {
 	InheritedOptions []cmdOption `yaml:"inherited_options,omitempty"`
 	Example          string      `yaml:"examples,omitempty"`
 	Deprecated       bool
+	Hidden           bool
 	MinAPIVersion    string `yaml:"min_api_version,omitempty"`
 	Experimental     bool
 	ExperimentalCLI  bool
@@ -74,62 +76,61 @@ type cmdDoc struct {
 // correctly if your command names have `-` in them. If you have `cmd` with two
 // subcmds, `sub` and `sub-third`, and `sub` has a subcommand called `third`
 // it is undefined which help output will be in the file `cmd-sub-third.1`.
-func GenYamlTree(cmd *cobra.Command, dir string) error {
-	emptyStr := func(s string) string { return "" }
-	if err := loadLongDescription(cmd, dir); err != nil {
+func (c *Client) GenYamlTree(cmd *cobra.Command) error {
+	emptyStr := func(string) string { return "" }
+	if err := c.loadLongDescription(cmd, "yaml"); err != nil {
 		return err
 	}
-	return GenYamlTreeCustom(cmd, dir, emptyStr)
+	return c.genYamlTreeCustom(cmd, emptyStr)
 }
 
-// GenYamlTreeCustom creates yaml structured ref files.
-func GenYamlTreeCustom(cmd *cobra.Command, dir string, filePrepender func(string) string) error {
-	for _, c := range cmd.Commands() {
-		if !c.Runnable() && !c.HasAvailableSubCommands() {
+// genYamlTreeCustom creates yaml structured ref files.
+func (c *Client) genYamlTreeCustom(cmd *cobra.Command, filePrepender func(string) string) error {
+	for _, sc := range cmd.Commands() {
+		if !sc.Runnable() && !sc.HasAvailableSubCommands() {
 			// skip non-runnable commands without subcommands
 			// but *do* generate YAML for hidden and deprecated commands
 			// the YAML will have those included as metadata, so that the
 			// documentation repository can decide whether or not to present them
 			continue
 		}
-		if err := GenYamlTreeCustom(c, dir, filePrepender); err != nil {
+		if err := c.genYamlTreeCustom(sc, filePrepender); err != nil {
 			return err
 		}
 	}
 
-	// TODO: conditionally skip the root command (for plugins)
-	//
+	// always disable the addition of [flags] to the usage
+	cmd.DisableFlagsInUseLine = true
+
 	// The "root" command used in the generator is just a "stub", and only has a
 	// list of subcommands, but not (e.g.) global options/flags. We should fix
 	// that, so that the YAML file for the docker "root" command contains the
 	// global flags.
-	//
-	// If we're using this code to generate YAML docs for a plugin, the root-
-	// command is even less useful; in that case, the root command represents
-	// the "docker" command, and is a "dummy" with no flags, and only a single
-	// subcommand (the plugin's top command). For plugins, we should skip the
-	// root command altogether, to prevent generating a useless YAML file.
-	if !cmd.HasParent() {
+
+	// Skip the root command altogether, to prevent generating a useless
+	// YAML file for plugins.
+	if c.plugin && !cmd.HasParent() {
 		return nil
 	}
+
 	log.Printf("INFO: Generating YAML for %q", cmd.CommandPath())
 	basename := strings.Replace(cmd.CommandPath(), " ", "_", -1) + ".yaml"
-	filename := filepath.Join(dir, basename)
-	f, err := os.Create(filename)
+	target := filepath.Join(c.target, basename)
+	f, err := os.Create(target)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	if _, err := io.WriteString(f, filePrepender(filename)); err != nil {
+	if _, err := io.WriteString(f, filePrepender(target)); err != nil {
 		return err
 	}
-	return GenYamlCustom(cmd, f)
+	return c.genYamlCustom(cmd, f)
 }
 
-// GenYamlCustom creates custom yaml output.
+// genYamlCustom creates custom yaml output.
 // nolint: gocyclo
-func GenYamlCustom(cmd *cobra.Command, w io.Writer) error {
+func (c *Client) genYamlCustom(cmd *cobra.Command, w io.Writer) error {
 	const (
 		// shortMaxWidth is the maximum width for the "Short" description before
 		// we force YAML to use multi-line syntax. The goal is to make the total
@@ -144,13 +145,18 @@ func GenYamlCustom(cmd *cobra.Command, w io.Writer) error {
 		longMaxWidth = 74
 	)
 
+	// necessary to add inherited flags otherwise some
+	// fields are not properly declared like usage
+	cmd.Flags().AddFlagSet(cmd.InheritedFlags())
+
 	cliDoc := cmdDoc{
 		Name:       cmd.CommandPath(),
-		Aliases:    strings.Join(cmd.Aliases, ", "),
+		Aliases:    strings.Join(getAliases(cmd), ", "),
 		Short:      forceMultiLine(cmd.Short, shortMaxWidth),
 		Long:       forceMultiLine(cmd.Long, longMaxWidth),
 		Example:    cmd.Example,
 		Deprecated: len(cmd.Deprecated) > 0,
+		Hidden:     cmd.Hidden,
 	}
 
 	if len(cliDoc.Long) == 0 {
@@ -161,7 +167,7 @@ func GenYamlCustom(cmd *cobra.Command, w io.Writer) error {
 		cliDoc.Usage = cmd.UseLine()
 	}
 
-	// Check recursively so that, e.g., `docker stack ls` returns the same output as `docker stack`
+	// check recursively to handle inherited annotations
 	for curr := cmd; curr != nil; curr = curr.Parent() {
 		if v, ok := curr.Annotations["version"]; ok && cliDoc.MinAPIVersion == "" {
 			cliDoc.MinAPIVersion = v
@@ -181,6 +187,14 @@ func GenYamlCustom(cmd *cobra.Command, w io.Writer) error {
 		if o, ok := curr.Annotations["ostype"]; ok && cliDoc.OSType == "" {
 			cliDoc.OSType = o
 		}
+		if _, ok := cmd.Annotations[annotation.CodeDelimiter]; !ok {
+			if cd, cok := curr.Annotations[annotation.CodeDelimiter]; cok {
+				if cmd.Annotations == nil {
+					cmd.Annotations = map[string]string{}
+				}
+				cmd.Annotations[annotation.CodeDelimiter] = cd
+			}
+		}
 	}
 
 	anchors := make(map[string]struct{})
@@ -192,11 +206,11 @@ func GenYamlCustom(cmd *cobra.Command, w io.Writer) error {
 
 	flags := cmd.NonInheritedFlags()
 	if flags.HasFlags() {
-		cliDoc.Options = genFlagResult(flags, anchors)
+		cliDoc.Options = genFlagResult(cmd, flags, anchors)
 	}
 	flags = cmd.InheritedFlags()
 	if flags.HasFlags() {
-		cliDoc.InheritedOptions = genFlagResult(flags, anchors)
+		cliDoc.InheritedOptions = genFlagResult(cmd, flags, anchors)
 	}
 
 	if hasSeeAlso(cmd) {
@@ -234,7 +248,7 @@ func GenYamlCustom(cmd *cobra.Command, w io.Writer) error {
 	return nil
 }
 
-func genFlagResult(flags *pflag.FlagSet, anchors map[string]struct{}) []cmdOption {
+func genFlagResult(cmd *cobra.Command, flags *pflag.FlagSet, anchors map[string]struct{}) []cmdOption {
 	var (
 		result []cmdOption
 		opt    cmdOption
@@ -256,14 +270,34 @@ func genFlagResult(flags *pflag.FlagSet, anchors map[string]struct{}) []cmdOptio
 
 	flags.VisitAll(func(flag *pflag.Flag) {
 		opt = cmdOption{
-			Option:       flag.Name,
-			ValueType:    flag.Value.Type(),
-			DefaultValue: forceMultiLine(flag.DefValue, defaultValueMaxWidth),
-			Description:  forceMultiLine(flag.Usage, descriptionMaxWidth),
-			Deprecated:   len(flag.Deprecated) > 0,
+			Option:     flag.Name,
+			ValueType:  flag.Value.Type(),
+			Deprecated: len(flag.Deprecated) > 0,
+			Hidden:     flag.Hidden,
 		}
 
-		if v, ok := flag.Annotations["docs.external.url"]; ok && len(v) > 0 {
+		var defval string
+		if v, ok := flag.Annotations[annotation.DefaultValue]; ok && len(v) > 0 {
+			defval = v[0]
+			if cd, ok := flag.Annotations[annotation.CodeDelimiter]; ok {
+				defval = strings.ReplaceAll(defval, cd[0], "`")
+			} else if cd, ok := cmd.Annotations[annotation.CodeDelimiter]; ok {
+				defval = strings.ReplaceAll(defval, cd, "`")
+			}
+		} else {
+			defval = flag.DefValue
+		}
+		opt.DefaultValue = forceMultiLine(defval, defaultValueMaxWidth)
+
+		usage := flag.Usage
+		if cd, ok := flag.Annotations[annotation.CodeDelimiter]; ok {
+			usage = strings.ReplaceAll(usage, cd[0], "`")
+		} else if cd, ok := cmd.Annotations[annotation.CodeDelimiter]; ok {
+			usage = strings.ReplaceAll(usage, cd, "`")
+		}
+		opt.Description = forceMultiLine(usage, descriptionMaxWidth)
+
+		if v, ok := flag.Annotations[annotation.ExternalURL]; ok && len(v) > 0 {
 			opt.DetailsURL = strings.TrimPrefix(v[0], "https://docs.docker.com")
 		} else if _, ok = anchors[flag.Name]; ok {
 			opt.DetailsURL = "#" + flag.Name
@@ -335,63 +369,6 @@ func hasSeeAlso(cmd *cobra.Command) bool {
 		return true
 	}
 	return false
-}
-
-// loadLongDescription gets long descriptions and examples from markdown.
-func loadLongDescription(parentCmd *cobra.Command, path string) error {
-	for _, cmd := range parentCmd.Commands() {
-		if cmd.HasSubCommands() {
-			if err := loadLongDescription(cmd, path); err != nil {
-				return err
-			}
-		}
-		name := cmd.CommandPath()
-		if i := strings.Index(name, " "); i >= 0 {
-			// remove root command / binary name
-			name = name[i+1:]
-		}
-		if name == "" {
-			continue
-		}
-		mdFile := strings.ReplaceAll(name, " ", "_") + ".md"
-		fullPath := filepath.Join(path, mdFile)
-		content, err := ioutil.ReadFile(fullPath)
-		if os.IsNotExist(err) {
-			log.Printf("WARN: %s does not exist, skipping Markdown examples for YAML doc\n", mdFile)
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		applyDescriptionAndExamples(cmd, string(content))
-	}
-	return nil
-}
-
-// applyDescriptionAndExamples fills in cmd.Long and cmd.Example with the
-// "Description" and "Examples" H2 sections in  mdString (if present).
-func applyDescriptionAndExamples(cmd *cobra.Command, mdString string) {
-	sections := getSections(mdString)
-	var (
-		anchors []string
-		md      string
-	)
-	if sections["description"] != "" {
-		md, anchors = cleanupMarkDown(sections["description"])
-		cmd.Long = md
-		anchors = append(anchors, md)
-	}
-	if sections["examples"] != "" {
-		md, anchors = cleanupMarkDown(sections["examples"])
-		cmd.Example = md
-		anchors = append(anchors, md)
-	}
-	if len(anchors) > 0 {
-		if cmd.Annotations == nil {
-			cmd.Annotations = make(map[string]string)
-		}
-		cmd.Annotations["anchors"] = strings.Join(anchors, ",")
-	}
 }
 
 type byName []*cobra.Command

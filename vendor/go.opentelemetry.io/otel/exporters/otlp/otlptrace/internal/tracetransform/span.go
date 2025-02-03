@@ -1,31 +1,17 @@
 // Copyright The OpenTelemetry Authors
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//     http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// SPDX-License-Identifier: Apache-2.0
 
-package tracetransform
+package tracetransform // import "go.opentelemetry.io/otel/exporters/otlp/otlptrace/internal/tracetransform"
 
 import (
+	"math"
+
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
-
 	"go.opentelemetry.io/otel/sdk/instrumentation"
 	tracesdk "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
-)
-
-const (
-	maxEventsPerSpan = 128
+	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
 )
 
 // Spans transforms a slice of OpenTelemetry spans into a slice of OTLP
@@ -37,11 +23,11 @@ func Spans(sdl []tracesdk.ReadOnlySpan) []*tracepb.ResourceSpans {
 
 	rsm := make(map[attribute.Distinct]*tracepb.ResourceSpans)
 
-	type ilsKey struct {
+	type key struct {
 		r  attribute.Distinct
-		il instrumentation.Library
+		is instrumentation.Scope
 	}
-	ilsm := make(map[ilsKey]*tracepb.InstrumentationLibrarySpans)
+	ssm := make(map[key]*tracepb.ScopeSpans)
 
 	var resources int
 	for _, sd := range sdl {
@@ -50,28 +36,30 @@ func Spans(sdl []tracesdk.ReadOnlySpan) []*tracepb.ResourceSpans {
 		}
 
 		rKey := sd.Resource().Equivalent()
-		iKey := ilsKey{
+		k := key{
 			r:  rKey,
-			il: sd.InstrumentationLibrary(),
+			is: sd.InstrumentationScope(),
 		}
-		ils, iOk := ilsm[iKey]
+		scopeSpan, iOk := ssm[k]
 		if !iOk {
-			// Either the resource or instrumentation library were unknown.
-			ils = &tracepb.InstrumentationLibrarySpans{
-				InstrumentationLibrary: InstrumentationLibrary(sd.InstrumentationLibrary()),
-				Spans:                  []*tracepb.Span{},
+			// Either the resource or instrumentation scope were unknown.
+			scopeSpan = &tracepb.ScopeSpans{
+				Scope:     InstrumentationScope(sd.InstrumentationScope()),
+				Spans:     []*tracepb.Span{},
+				SchemaUrl: sd.InstrumentationScope().SchemaURL,
 			}
 		}
-		ils.Spans = append(ils.Spans, span(sd))
-		ilsm[iKey] = ils
+		scopeSpan.Spans = append(scopeSpan.Spans, span(sd))
+		ssm[k] = scopeSpan
 
 		rs, rOk := rsm[rKey]
 		if !rOk {
 			resources++
 			// The resource was unknown.
 			rs = &tracepb.ResourceSpans{
-				Resource:                    Resource(sd.Resource()),
-				InstrumentationLibrarySpans: []*tracepb.InstrumentationLibrarySpans{ils},
+				Resource:   Resource(sd.Resource()),
+				ScopeSpans: []*tracepb.ScopeSpans{scopeSpan},
+				SchemaUrl:  sd.Resource().SchemaURL(),
 			}
 			rsm[rKey] = rs
 			continue
@@ -81,9 +69,9 @@ func Spans(sdl []tracesdk.ReadOnlySpan) []*tracepb.ResourceSpans {
 		// library lookup was unknown because if so we need to add it to the
 		// ResourceSpans. Otherwise, the instrumentation library has already
 		// been seen and the append we did above will be included it in the
-		// InstrumentationLibrarySpans reference.
+		// ScopeSpans reference.
 		if !iOk {
-			rs.InstrumentationLibrarySpans = append(rs.InstrumentationLibrarySpans, ils)
+			rs.ScopeSpans = append(rs.ScopeSpans, scopeSpan)
 		}
 	}
 
@@ -109,33 +97,46 @@ func span(sd tracesdk.ReadOnlySpan) *tracepb.Span {
 		SpanId:                 sid[:],
 		TraceState:             sd.SpanContext().TraceState().String(),
 		Status:                 status(sd.Status().Code, sd.Status().Description),
-		StartTimeUnixNano:      uint64(sd.StartTime().UnixNano()),
-		EndTimeUnixNano:        uint64(sd.EndTime().UnixNano()),
+		StartTimeUnixNano:      uint64(max(0, sd.StartTime().UnixNano())), // nolint:gosec // Overflow checked.
+		EndTimeUnixNano:        uint64(max(0, sd.EndTime().UnixNano())),   // nolint:gosec // Overflow checked.
 		Links:                  links(sd.Links()),
 		Kind:                   spanKind(sd.SpanKind()),
 		Name:                   sd.Name(),
-		Attributes:             Attributes(sd.Attributes()),
+		Attributes:             KeyValues(sd.Attributes()),
 		Events:                 spanEvents(sd.Events()),
-		DroppedAttributesCount: uint32(sd.DroppedAttributes()),
-		DroppedEventsCount:     uint32(sd.DroppedEvents()),
-		DroppedLinksCount:      uint32(sd.DroppedLinks()),
+		DroppedAttributesCount: clampUint32(sd.DroppedAttributes()),
+		DroppedEventsCount:     clampUint32(sd.DroppedEvents()),
+		DroppedLinksCount:      clampUint32(sd.DroppedLinks()),
 	}
 
 	if psid := sd.Parent().SpanID(); psid.IsValid() {
 		s.ParentSpanId = psid[:]
 	}
+	s.Flags = buildSpanFlags(sd.Parent())
 
 	return s
+}
+
+func clampUint32(v int) uint32 {
+	if v < 0 {
+		return 0
+	}
+	if int64(v) > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(v) // nolint: gosec  // Overflow/Underflow checked.
 }
 
 // status transform a span code and message into an OTLP span status.
 func status(status codes.Code, message string) *tracepb.Status {
 	var c tracepb.Status_StatusCode
 	switch status {
+	case codes.Ok:
+		c = tracepb.Status_STATUS_CODE_OK
 	case codes.Error:
 		c = tracepb.Status_STATUS_CODE_ERROR
 	default:
-		c = tracepb.Status_STATUS_CODE_OK
+		c = tracepb.Status_STATUS_CODE_UNSET
 	}
 	return &tracepb.Status{
 		Code:    c,
@@ -144,7 +145,7 @@ func status(status codes.Code, message string) *tracepb.Status {
 }
 
 // links transforms span Links to OTLP span links.
-func links(links []trace.Link) []*tracepb.Span_Link {
+func links(links []tracesdk.Link) []*tracepb.Span_Link {
 	if len(links) == 0 {
 		return nil
 	}
@@ -158,13 +159,26 @@ func links(links []trace.Link) []*tracepb.Span_Link {
 		tid := otLink.SpanContext.TraceID()
 		sid := otLink.SpanContext.SpanID()
 
+		flags := buildSpanFlags(otLink.SpanContext)
+
 		sl = append(sl, &tracepb.Span_Link{
-			TraceId:    tid[:],
-			SpanId:     sid[:],
-			Attributes: Attributes(otLink.Attributes),
+			TraceId:                tid[:],
+			SpanId:                 sid[:],
+			Attributes:             KeyValues(otLink.Attributes),
+			DroppedAttributesCount: clampUint32(otLink.DroppedAttributeCount),
+			Flags:                  flags,
 		})
 	}
 	return sl
+}
+
+func buildSpanFlags(sc trace.SpanContext) uint32 {
+	flags := tracepb.SpanFlags_SPAN_FLAGS_CONTEXT_HAS_IS_REMOTE_MASK
+	if sc.IsRemote() {
+		flags |= tracepb.SpanFlags_SPAN_FLAGS_CONTEXT_IS_REMOTE_MASK
+	}
+
+	return uint32(flags) // nolint:gosec // Flags is a bitmask and can't be negative
 }
 
 // spanEvents transforms span Events to an OTLP span events.
@@ -173,29 +187,16 @@ func spanEvents(es []tracesdk.Event) []*tracepb.Span_Event {
 		return nil
 	}
 
-	evCount := len(es)
-	if evCount > maxEventsPerSpan {
-		evCount = maxEventsPerSpan
-	}
-	events := make([]*tracepb.Span_Event, 0, evCount)
-	nEvents := 0
-
+	events := make([]*tracepb.Span_Event, len(es))
 	// Transform message events
-	for _, e := range es {
-		if nEvents >= maxEventsPerSpan {
-			break
+	for i := 0; i < len(es); i++ {
+		events[i] = &tracepb.Span_Event{
+			Name:                   es[i].Name,
+			TimeUnixNano:           uint64(max(0, es[i].Time.UnixNano())), // nolint:gosec // Overflow checked.
+			Attributes:             KeyValues(es[i].Attributes),
+			DroppedAttributesCount: clampUint32(es[i].DroppedAttributeCount),
 		}
-		nEvents++
-		events = append(events,
-			&tracepb.Span_Event{
-				Name:         e.Name,
-				TimeUnixNano: uint64(e.Time.UnixNano()),
-				Attributes:   Attributes(e.Attributes),
-				// TODO (rghetia) : Add Drop Counts when supported.
-			},
-		)
 	}
-
 	return events
 }
 

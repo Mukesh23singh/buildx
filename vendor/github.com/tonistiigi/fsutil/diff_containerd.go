@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/tonistiigi/fsutil/types"
@@ -32,6 +33,19 @@ const (
 	// a file
 	ChangeKindDelete
 )
+
+func (k ChangeKind) String() string {
+	switch k {
+	case ChangeKindAdd:
+		return "add"
+	case ChangeKindModify:
+		return "modify"
+	case ChangeKindDelete:
+		return "delete"
+	default:
+		return "unknown"
+	}
+}
 
 // ChangeFunc is the type of function called for each change
 // computed during a directory changes calculation.
@@ -93,11 +107,11 @@ func doubleWalkDiff(ctx context.Context, changeFn ChangeFunc, a, b walkerFn, fil
 			var f *types.Stat
 			var f2copy *currentPath
 			if f2 != nil {
-				statCopy := *f2.stat
+				statCopy := f2.stat.Clone()
 				if filter != nil {
-					filter(f2.path, &statCopy)
+					filter(f2.path, statCopy)
 				}
-				f2copy = &currentPath{path: f2.path, stat: &statCopy}
+				f2copy = &currentPath{path: f2.path, stat: statCopy}
 			}
 			k, p := pathChange(f1, f2copy)
 			switch k {
@@ -114,7 +128,7 @@ func doubleWalkDiff(ctx context.Context, changeFn ChangeFunc, a, b walkerFn, fil
 					f1 = nil
 					continue
 				} else if rmdir == "" && f1.stat.IsDir() {
-					rmdir = f1.path + string(os.PathSeparator)
+					rmdir = f1.path + string(filepath.Separator)
 				} else if rmdir != "" {
 					rmdir = ""
 				}
@@ -125,7 +139,7 @@ func doubleWalkDiff(ctx context.Context, changeFn ChangeFunc, a, b walkerFn, fil
 					return err
 				}
 				if f1.stat.IsDir() && !f2copy.stat.IsDir() {
-					rmdir = f1.path + string(os.PathSeparator)
+					rmdir = f1.path + string(filepath.Separator)
 				} else if rmdir != "" {
 					rmdir = ""
 				}
@@ -175,7 +189,7 @@ func sameFile(f1, f2 *currentPath, differ DiffType) (same bool, retErr error) {
 	}
 	// If not a directory also check size, modtime, and content
 	if !f1.stat.IsDir() {
-		if f1.stat.Size_ != f2.stat.Size_ {
+		if f1.stat.Size != f2.stat.Size {
 			return false, nil
 		}
 

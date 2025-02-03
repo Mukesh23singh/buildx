@@ -1,19 +1,22 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"text/tabwriter"
+	"time"
 
-	"github.com/docker/buildx/build"
+	"github.com/docker/buildx/builder"
+	"github.com/docker/buildx/util/cobrautil/completion"
 	"github.com/docker/cli/cli"
 	"github.com/docker/cli/cli/command"
 	"github.com/docker/cli/opts"
+	"github.com/docker/go-units"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/util/appcontext"
 	"github.com/spf13/cobra"
-	"github.com/tonistiigi/units"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -23,33 +26,35 @@ type duOptions struct {
 	verbose bool
 }
 
-func runDiskUsage(dockerCli command.Cli, opts duOptions) error {
-	ctx := appcontext.Context()
-
+func runDiskUsage(ctx context.Context, dockerCli command.Cli, opts duOptions) error {
 	pi, err := toBuildkitPruneInfo(opts.filter.Value())
 	if err != nil {
 		return err
 	}
 
-	dis, err := getInstanceOrDefault(ctx, dockerCli, opts.builder, "")
+	b, err := builder.New(dockerCli, builder.WithName(opts.builder))
 	if err != nil {
 		return err
 	}
 
-	for _, di := range dis {
-		if di.Err != nil {
-			return err
+	nodes, err := b.LoadNodes(ctx)
+	if err != nil {
+		return err
+	}
+	for _, node := range nodes {
+		if node.Err != nil {
+			return node.Err
 		}
 	}
 
-	out := make([][]*client.UsageInfo, len(dis))
+	out := make([][]*client.UsageInfo, len(nodes))
 
 	eg, ctx := errgroup.WithContext(ctx)
-	for i, di := range dis {
-		func(i int, di build.DriverInfo) {
+	for i, node := range nodes {
+		func(i int, node builder.Node) {
 			eg.Go(func() error {
-				if di.Driver != nil {
-					c, err := di.Driver.Client(ctx)
+				if node.Driver != nil {
+					c, err := node.Driver.Client(ctx)
 					if err != nil {
 						return err
 					}
@@ -62,7 +67,7 @@ func runDiskUsage(dockerCli command.Cli, opts duOptions) error {
 				}
 				return nil
 			})
-		}(i, di)
+		}(i, node)
 	}
 
 	if err := eg.Wait(); err != nil {
@@ -107,8 +112,9 @@ func duCmd(dockerCli command.Cli, rootOpts *rootOptions) *cobra.Command {
 		Args:  cli.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			options.builder = rootOpts.builder
-			return runDiskUsage(dockerCli, options)
+			return runDiskUsage(cmd.Context(), dockerCli, options)
 		},
+		ValidArgsFunction: completion.Disable,
 	}
 
 	flags := cmd.Flags()
@@ -125,20 +131,20 @@ func printKV(w io.Writer, k string, v interface{}) {
 func printVerbose(tw *tabwriter.Writer, du []*client.UsageInfo) {
 	for _, di := range du {
 		printKV(tw, "ID", di.ID)
-		if di.Parent != "" {
-			printKV(tw, "Parent", di.Parent)
+		if len(di.Parents) != 0 {
+			printKV(tw, "Parent", strings.Join(di.Parents, ","))
 		}
 		printKV(tw, "Created at", di.CreatedAt)
 		printKV(tw, "Mutable", di.Mutable)
 		printKV(tw, "Reclaimable", !di.InUse)
 		printKV(tw, "Shared", di.Shared)
-		printKV(tw, "Size", fmt.Sprintf("%.2f", units.Bytes(di.Size)))
+		printKV(tw, "Size", units.HumanSize(float64(di.Size)))
 		if di.Description != "" {
 			printKV(tw, "Description", di.Description)
 		}
 		printKV(tw, "Usage count", di.UsageCount)
 		if di.LastUsedAt != nil {
-			printKV(tw, "Last used", di.LastUsedAt)
+			printKV(tw, "Last used", units.HumanDuration(time.Since(*di.LastUsedAt))+" ago")
 		}
 		if di.RecordType != "" {
 			printKV(tw, "Type", di.RecordType)
@@ -159,11 +165,15 @@ func printTableRow(tw *tabwriter.Writer, di *client.UsageInfo) {
 	if di.Mutable {
 		id += "*"
 	}
-	size := fmt.Sprintf("%.2f", units.Bytes(di.Size))
+	size := units.HumanSize(float64(di.Size))
 	if di.Shared {
 		size += "*"
 	}
-	fmt.Fprintf(tw, "%-71s\t%-11v\t%s\t\n", id, !di.InUse, size)
+	lastAccessed := ""
+	if di.LastUsedAt != nil {
+		lastAccessed = units.HumanDuration(time.Since(*di.LastUsedAt)) + " ago"
+	}
+	fmt.Fprintf(tw, "%-40s\t%-5v\t%-10s\t%s\n", id, !di.InUse, size, lastAccessed)
 }
 
 func printSummary(tw *tabwriter.Writer, dus [][]*client.UsageInfo) {
@@ -186,11 +196,11 @@ func printSummary(tw *tabwriter.Writer, dus [][]*client.UsageInfo) {
 	}
 
 	if shared > 0 {
-		fmt.Fprintf(tw, "Shared:\t%.2f\n", units.Bytes(shared))
-		fmt.Fprintf(tw, "Private:\t%.2f\n", units.Bytes(total-shared))
+		fmt.Fprintf(tw, "Shared:\t%s\n", units.HumanSize(float64(shared)))
+		fmt.Fprintf(tw, "Private:\t%s\n", units.HumanSize(float64(total-shared)))
 	}
 
-	fmt.Fprintf(tw, "Reclaimable:\t%.2f\n", units.Bytes(reclaimable))
-	fmt.Fprintf(tw, "Total:\t%.2f\n", units.Bytes(total))
+	fmt.Fprintf(tw, "Reclaimable:\t%s\n", units.HumanSize(float64(reclaimable)))
+	fmt.Fprintf(tw, "Total:\t%s\n", units.HumanSize(float64(total)))
 	tw.Flush()
 }

@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-variable "GO_VERSION" {
-  default = "1.16"
+target "_common" {
+  args = {
+    BUILDKIT_CONTEXT_KEEP_GIT_DIR = 1
+  }
 }
 
 group "default" {
@@ -25,49 +27,37 @@ group "validate" {
 }
 
 target "lint" {
-  args = {
-    GO_VERSION = GO_VERSION
-  }
-  dockerfile = "./hack/lint.Dockerfile"
+  inherits = ["_common"]
   target = "lint"
   output = ["type=cacheonly"]
 }
 
 target "vendor-validate" {
-  args = {
-    GO_VERSION = GO_VERSION
-  }
-  dockerfile = "./hack/vendor.Dockerfile"
-  target = "validate"
+  inherits = ["_common"]
+  target = "vendor-validate"
   output = ["type=cacheonly"]
 }
 
 target "vendor-update" {
-  args = {
-    GO_VERSION = GO_VERSION
-  }
-  dockerfile = "./hack/vendor.Dockerfile"
-  target = "update"
+  inherits = ["_common"]
+  target = "vendor-update"
   output = ["."]
 }
 
 target "test" {
-  args = {
-    GO_VERSION = GO_VERSION
-  }
-  dockerfile = "./hack/test.Dockerfile"
+  inherits = ["_common"]
   target = "test-coverage"
   output = ["."]
 }
 
 target "license-validate" {
-  dockerfile = "./hack/license.Dockerfile"
-  target = "validate"
+  inherits = ["_common"]
+  target = "license-validate"
   output = ["type=cacheonly"]
 }
 
 target "license-update" {
-  dockerfile = "./hack/license.Dockerfile"
-  target = "update"
+  inherits = ["_common"]
+  target = "license-update"
   output = ["."]
 }
